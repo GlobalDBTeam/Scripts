@@ -1,0 +1,157 @@
+SET NOCOUNT ON
+DECLARE @Trace_RecNo AS DECIMAL, @Trace_File AS VARCHAR(1000), @ServerName AS VARCHAR(100), @HostName AS VARCHAR(256), @LoginName AS VARCHAR(256), @ApplicationName AS VARCHAR(256), @FilterType AS VARCHAR(5), @ROWCNT INT
+DECLARE @HTMLTable varchar(max), @HTML varchar(max)
+DECLARE @User_Account_Filter AS CURSOR, @Audit_File AS CURSOR
+DECLARE @RetentionDate AS DATE
+
+TRUNCATE TABLE DBADB.[dbo].[Login_Hist_Report]
+TRUNCATE TABLE DBADB.[dbo].[Login_Hist]
+
+SET @Audit_File = CURSOR FOR
+SELECT Trace_RecNo, Trace_File FROM DBADB.dbo.Audit_File WHERE Is_Process = 'N'
+OPEN @Audit_File;
+FETCH NEXT FROM @Audit_File INTO @Trace_RecNo, @Trace_File;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+	IF @@CURSOR_ROWS <> 0 
+	BEGIN
+		INSERT INTO DBADB.[dbo].[Login_Hist]
+		SELECT *
+		FROM ::fn_trace_gettable(@Trace_File +'.trc', default)
+		
+		INSERT INTO DBADB.[dbo].[Login_Hist_Report]
+		SELECT [EventClass], [DatabaseID], [NTUserName], [NTDomainName], [HostName], [ApplicationName], [LoginName], [Success], [ServerName], [DatabaseName], COUNT(*) AS NumberOfConnections
+		FROM [DBADB].[dbo].[Login_Hist]
+		WHERE [LoginName] IS NOT NULL
+		GROUP BY [EventClass], [DatabaseID], [NTUserName], [NTDomainName], [HostName], [ApplicationName], [LoginName], [Success], [ServerName], [DatabaseName]
+		UPDATE DBADB.dbo.Audit_File SET Is_Process = 'Y' WHERE Trace_RecNo = @Trace_RecNo
+		
+		SET @RetentionDate = convert(varchar, getdate()-30, 112) 
+		EXEC master.dbo.SQLIO_DeleteFilesOlderThan 'D:\Trace','*.trc',1, @RetentionDate
+	END
+	FETCH NEXT FROM @Audit_File INTO @Trace_RecNo, @Trace_File;
+END
+
+SET @User_Account_Filter = CURSOR FOR
+SELECT ServerName, HostName, LoginName, ApplicationName, FilterType FROM DBADB.dbo.User_Account_Filter
+
+OPEN @User_Account_Filter;
+FETCH NEXT FROM @User_Account_Filter INTO @ServerName, @HostName, @LoginName, @ApplicationName, @FilterType;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+	IF @FilterType = 'ILIKE'
+	BEGIN
+		--PRINT @ServerName + ' ' + @HostName + ' ' + @LoginName + ' ' + @ApplicationName + ' ' + @FilterType
+		DELETE FROM DBADB.dbo.Login_Hist_Report
+		WHERE HostName = @HostName
+			AND LoginName = @LoginName
+			AND ApplicationName LIKE '%' + @ApplicationName + '%'
+	END
+	IF @FilterType = 'EQUAL'
+	BEGIN
+		--PRINT @ServerName + ' ' + @HostName + ' ' + @LoginName + ' ' + @ApplicationName + ' ' + @FilterType
+		DELETE FROM DBADB.dbo.Login_Hist_Report
+		WHERE HostName = @HostName
+			AND LoginName = @LoginName
+			AND ApplicationName = @ApplicationName
+	END
+	FETCH NEXT FROM @User_Account_Filter INTO @ServerName, @HostName, @LoginName, @ApplicationName, @FilterType;
+END
+ 
+CLOSE @User_Account_Filter;
+DEALLOCATE @User_Account_Filter;
+
+SET @HTMLTable = '<h2>Login History</h2>
+			<table>
+			<tr>
+			<th>ServerName</th>
+			<th>HostName</th>
+			<th>LoginName</th>
+			<th>ApplicationName</th>
+			<th>NumberOfConnections</th>
+			</tr>' 
+			+(SELECT ServerName td,
+					HostName td,
+					LoginName td,
+					ApplicationName td,
+					NumberOfConnections td
+			FROM DBADB.dbo.Login_Hist_Report
+			FOR XML RAW('tr'),ELEMENTS XSINIL
+			)
+			+ '</table>'
+SET @HTML = 
+'<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<style type="text/css">
+table {
+font:8pt tahoma,arial,sans-serif;
+}
+th {
+color:#FFFFFF;
+font:bold 8pt tahoma,arial,sans-serif;
+background-color:#204c7d;
+padding-left:5px;
+padding-right:5px;
+}
+td {
+color:#000000;
+font:8pt tahoma,arial,sans-serif;
+border:1px solid #DCDCDC;
+border-collapse:collapse;
+padding-left:3px;
+padding-right:3px;
+}
+.Warning {
+background-color:#FFFF00; 
+color:#2E2E2E;
+}
+.Critical {
+background-color:#FF0000;
+color:#FFFFFF;
+}
+.Healthy {
+background-color:#458B00;
+color:#FFFFFF;
+}
+h1 {
+color:#FFFFFF;
+font:bold 16pt arial,sans-serif;
+background-color:#204c7d;
+text-align:center;
+}
+h2 {
+color:#204c7d;
+font:bold 14pt arial,sans-serif;
+}
+h3 {
+color:#204c7d;
+font:bold 12pt arial,sans-serif;
+}
+body {
+color:#000000;
+font:8pt tahoma,arial,sans-serif;
+margin:0px;
+padding:0px;
+}
+</style>
+</head>
+<body>
+<h1>Audit Security for ' + @@SERVERNAME + '</h1>'
++ COALESCE(@HTMLTable,'<div class="Critical">Error collecting Login History</div>')
++ '</body></html>'
+
+declare @subject varchar(50), @MailProfile sysname
+SELECT TOP 1 @MailProfile = [name]  FROM msdb.dbo.sysmail_profile
+set @subject = 'Audit Security Report for  (' + @@SERVERNAME + ')'
+SELECT @ROWCNT = COUNT(*)  FROM DBADB.dbo.Login_Hist_Report
+IF @ROWCNT <> 0 
+BEGIN
+	EXEC msdb.dbo.sp_send_dbmail
+		@recipients ='globalit.database@transcom.com',
+		@body = @HTML,
+		@body_format ='HTML',
+		@subject = @subject,
+		@profile_name = @MailProfile
+END
+GO
